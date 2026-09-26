@@ -1,0 +1,21 @@
+services:
+  api:
+    build: .
+    image: water-quality-api:local
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      WATER_ALARM_THRESHOLD: "10.0"
+      WATER_RECOVERY_THRESHOLD: "5.0"
+      WATER_MAX_SAMPLE_GAP_SECONDS: "600"
+      WATER_DATABASE_PATH: "/data/water.db"
+    volumes:
+      - water_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  water_data:

@@ -1,0 +1,12 @@
+.git
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.db
+*.db-wal
+*.db-shm
+tests/
+README.md
+Dockerfile
+docker-compose.yml
