@@ -5,9 +5,11 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import quote
 
 from . import db
+from .backup import BackupArchive, build_backup_archive
 from .config import Settings
 from .schemas import (
     AcknowledgeIn,
@@ -567,6 +569,24 @@ class WaterQualityService:
             head_change_id=head_change_id,
             changes=changes,
         )
+
+    def create_backup(
+        self, work_dir: str | Path | None = None
+    ) -> BackupArchive:
+        """Produce the downloadable backup ZIP for the current committed state.
+
+        The backup reads the online database through the SQLite online
+        backup API, so concurrent sampling writes, late recomputations,
+        corrections and acknowledgements cannot split the packaged data
+        across transactions: it is one committed snapshot. Holding the
+        service write lock additionally keeps this process from issuing
+        statements on the shared connection while a write path's read or
+        write transaction is mid-flight; the API itself remains the
+        cross-process consistency guarantee. The backup never writes to
+        the online database.
+        """
+        with self._write_lock:
+            return build_backup_archive(self._connection, work_dir=work_dir)
 
     def list_coincident_alarms(
         self, payload: CoincidentAlarmsIn

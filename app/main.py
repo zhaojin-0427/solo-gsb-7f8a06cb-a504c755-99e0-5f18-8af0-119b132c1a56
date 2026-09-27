@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
@@ -8,9 +9,11 @@ from typing import Annotated, Literal
 from fastapi import Depends, FastAPI, Query, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 
 from . import db
+from .backup import BackupError
 from .config import Settings
 from .schemas import (
     AcknowledgeIn,
@@ -111,9 +114,66 @@ def handle_not_found(_request, exc: NotFoundError) -> JSONResponse:
     )
 
 
+@app.exception_handler(BackupError)
+def handle_backup_failure(_request, exc: BackupError) -> JSONResponse:
+    # A failed backup never produces a download: the staging files have
+    # already been removed and the online database was never modified.
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": str(exc)},
+    )
+
+
+def _remove_file(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post(
+    "/maintenance/backup",
+    tags=["maintenance"],
+    responses={
+        200: {
+            "content": {"application/zip": {}},
+            "description": "ZIP archive containing water.db and manifest.json",
+        },
+        500: {"description": "Backup failed (e.g. integrity check); no file is sent"},
+    },
+)
+def create_backup(
+    service: Annotated[WaterQualityService, Depends(get_service)],
+) -> FileResponse:
+    """
+    Download a ZIP holding ``water.db`` and ``manifest.json``.
+
+    ``water.db`` is one committed snapshot taken through the SQLite
+    online backup API, so it never mixes pages of different transactions
+    even when sampling writes, late recomputations, corrections or
+    acknowledgements commit concurrently. ``manifest.json`` is read from
+    the backup database itself and records the ``schema_version``, row
+    counts of ``samples``, ``events``, ``event_changes`` and
+    ``event_acks``, the maximum ``change_id`` (0 without changes), the
+    snapshot time and the SHA-256 of the packaged ``water.db``. The
+    backup database passes ``PRAGMA integrity_check`` before packaging;
+    on failure the temporary files are cleaned up, no partial archive is
+    sent and the online database is untouched. Place the extracted
+    ``water.db`` at ``WATER_DATABASE_PATH`` (default ``/data/water.db``)
+    to start the service with the backed-up data.
+    """
+    archive = service.create_backup()
+    return FileResponse(
+        path=archive.path,
+        media_type="application/zip",
+        filename=archive.path.name,
+        background=BackgroundTask(_remove_file, str(archive.path)),
+    )
 
 
 @app.get("/thresholds", response_model=ThresholdsOut, tags=["config"])

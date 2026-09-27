@@ -180,6 +180,60 @@ def set_meta(connection: sqlite3.Connection, key: str, value: Any) -> None:
     )
 
 
+def online_backup(
+    connection: sqlite3.Connection, target_path: str | Path
+) -> None:
+    """Copy one committed snapshot of ``connection`` into a fresh file.
+
+    Uses the SQLite online backup API in a single ``backup(..., pages=0)``
+    call, which transfers the whole database in one step. The backup
+    reader pins a single read snapshot for its whole duration, so the copy
+    never mixes pages of different transactions even while sampling
+    writes, late recomputations, corrections or acknowledgements commit
+    concurrently: SQLite transparently restarts the copy if the source
+    advances underneath it. Nothing here ever writes to the online
+    database.
+
+    The destination is a brand-new file: after the copy it is switched
+    from WAL (inherited from the source) to the rollback journal and
+    closed, which checkpoints it into one self-contained file and removes
+    any ``-wal``/``-shm`` sidecars. The downloaded ``water.db`` is
+    therefore directly usable as ``WATER_DATABASE_PATH`` without orphaned
+    WAL files.
+    """
+    path = Path(target_path)
+    if path.parent != Path("."):
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    destination = sqlite3.connect(
+        str(path),
+        check_same_thread=False,
+        isolation_level=None,
+        timeout=30.0,
+    )
+    try:
+        connection.backup(destination, pages=0)
+        # The backup copies the source's WAL mode marker. Switching the
+        # destination to the rollback journal checkpoints its copy into the
+        # main file so the backup is a single portable database file; this
+        # never touches the online source.
+        mode = destination.execute("PRAGMA journal_mode=DELETE").fetchone()
+        if mode is not None and str(mode[0]).lower() != "delete":
+            raise sqlite3.DatabaseError(
+                "backup database could not be switched to rollback journal "
+                f"mode (got {mode[0]!r})"
+            )
+    except Exception:
+        destination.close()
+        for suffix in ("", "-wal", "-shm"):
+            sidecar = Path(str(path) + suffix)
+            if sidecar.exists():
+                sidecar.unlink()
+        raise
+    else:
+        destination.close()
+
+
 @contextmanager
 def write_transaction(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     connection.execute("BEGIN IMMEDIATE")

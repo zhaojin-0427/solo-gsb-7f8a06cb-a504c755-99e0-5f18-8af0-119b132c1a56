@@ -1,6 +1,6 @@
 # 本地水质采样事件 API
 
-使用 FastAPI + SQLite 实现。客户端以批量方式提交设备浊度采样；服务端按 `(device_id, sequence)` 去重，允许乱序和迟到记录，通过“告警阈值 + 恢复阈值”的滞回规则维护连续浊度告警事件，并按最大采样间隔识别观测中断。已入库的误测记录可通过更正接口在校验旧值后修改采样时间与浊度，并同步重算该设备的告警事件。每次成功的写入、重放或更正还会在同一事务内向**增量事件变更流**追加按事件比对出的差异（`upsert` / `delete`），供下游以“快照 + 变更流”方式复制事件。运维人员可对当前版本的事件做**人工确认**；确认随事件版本失效，且不影响变更流。此外还提供多设备**共同告警查询**，找出指定时间窗内同时处于告警状态的设备数达到阈值的连续区段；**事件证据查询**，按采样列出当前告警事件由哪些观测形成；以及单设备**超阈浊度累积查询**，按时间窗对原始采样做线性插值，累计浊度超过指定阈值的时长与面积。
+使用 FastAPI + SQLite 实现。客户端以批量方式提交设备浊度采样；服务端按 `(device_id, sequence)` 去重，允许乱序和迟到记录，通过“告警阈值 + 恢复阈值”的滞回规则维护连续浊度告警事件，并按最大采样间隔识别观测中断。已入库的误测记录可通过更正接口在校验旧值后修改采样时间与浊度，并同步重算该设备的告警事件。每次成功的写入、重放或更正还会在同一事务内向**增量事件变更流**追加按事件比对出的差异（`upsert` / `delete`），供下游以“快照 + 变更流”方式复制事件。运维人员可对当前版本的事件做**人工确认**；确认随事件版本失效，且不影响变更流。此外还提供多设备**共同告警查询**，找出指定时间窗内同时处于告警状态的设备数达到阈值的连续区段；**事件证据查询**，按采样列出当前告警事件由哪些观测形成；以及单设备**超阈浊度累积查询**，按时间窗对原始采样做线性插值，累计浊度超过指定阈值的时长与面积。最后提供 `POST /maintenance/backup` **备份下载**接口：通过 SQLite 在线备份接口生成单个已提交快照，打包 `water.db` 与记录结构版本、业务表行数、最大 `change_id` 和 SHA-256 的 `manifest.json`，可按原配置离线恢复。
 
 ## 一条命令启动
 
@@ -465,6 +465,81 @@ curl -s -X POST http://127.0.0.1:8000/devices/sensor-01/turbidity-exposure \
 
 三者均保留小数秒不截断；窗口内没有任何覆盖段时三者均为 `0`。迟到写入或更正生效后，下一次查询立即按最新采样计算；查询本身是**只读**的，不写入采样、事件、确认，也不追加变更流（不产生 `/event-changes` 记录）。
 
+### 11. 维护：下载备份
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/maintenance/backup -o backup.zip
+unzip -d backup backup.zip
+cat backup/manifest.json
+```
+
+返回 `200` 与一个 ZIP 附件，包内只有两个文件：
+
+- `water.db`：通过 SQLite **在线备份接口**（online backup API）一次性生成的单个**已提交快照**。即使备份与采样写入、迟到重算、更正或人工确认并发执行，包内数据也不会跨事务混合——在线备份读取的是一个稳定快照，备份期间源库提交的新事务不会被切进包里；备份过程**从不写入在线库**。
+- `manifest.json`：清单内容全部从**备份库**（而非在线库）读取，记录：
+  - `schema_version`：备份库的结构版本；
+  - `table_counts`：四张业务表 `samples`、`events`、`event_changes`、`event_acks` 的行数；
+  - `max_change_id`：变更流最大 `change_id`，尚无变更时为 `0`；
+  - `water_db_sha256`：包内 `water.db` 的 SHA-256；
+  - `created_at`：快照生成时间（UTC，`Z`）、`database`（固定为 `water.db`）。
+
+打包前会对备份库执行 `PRAGMA integrity_check`：只有结果为 `ok` 才会打包。校验失败（或备份过程出错）时，返回 `500` JSON 错误并清理全部临时文件，**不发送半成品**，在线库也不发生任何改动。下载到的 `water.db` 已转换为单一回滚日志文件（不附带 `-wal`/`-shm`），直接放到 `WATER_DATABASE_PATH` 即可使用。清单示例：
+
+```json
+{
+  "created_at": "2026-09-27T00:27:33Z",
+  "database": "water.db",
+  "water_db_sha256": "09d1ef3c6fd1c88c6d8dcc63bbedd3395ce58334c14c1f93a0642eaf00df1e",
+  "max_change_id": 2,
+  "schema_version": 5,
+  "table_counts": {
+    "event_acks": 0,
+    "event_changes": 2,
+    "events": 2,
+    "samples": 4
+  }
+}
+```
+
+可用清单中的哈希核对落盘文件：
+
+```bash
+(cd backup && echo "$(grep -o '"water_db_sha256": *"[^"]*"' manifest.json | cut -d'"' -f4)  water.db" | sha256sum -c)
+```
+
+#### 离线恢复
+
+恢复就是把包内的 `water.db` 放到 `WATER_DATABASE_PATH`（默认 `/data/water.db`）再启动；不需要额外迁移命令，服务启动时会自动处理版本迁移，数据卷的挂载方式与 `docker compose up --build` 一条命令启动时完全相同。
+
+Docker Compose（数据在命名卷 `water_data` 中）：
+
+```bash
+# 1. 停服（不要用 -v，保留数据卷）
+docker compose down
+
+# 2. 解包并按清单校验 SHA-256
+unzip -o backup.zip -d backup
+(cd backup && echo "$(grep -o '"water_db_sha256": *"[^"]*"' manifest.json | cut -d'"' -f4)  water.db" | sha256sum -c)
+
+# 3. 用同一个数据卷把备份库放到 /data/water.db，并清掉可能存在的旧 WAL 伴随文件
+docker compose run --rm --no-deps -v "$PWD/backup:/backup" --entrypoint sh \
+  api -c 'cp /backup/water.db /data/water.db && rm -f /data/water.db-wal /data/water.db-shm'
+
+# 4. 一条命令启动；恢复后的 samples/events/event_changes/event_acks 即备份时刻的状态
+docker compose up -d
+```
+
+本地非容器开发（`WATER_DATABASE_PATH=./water.db`）：
+
+```bash
+unzip -o backup.zip -d backup
+cp backup/water.db ./water.db
+rm -f ./water.db-wal ./water.db-shm
+WATER_DATABASE_PATH=./water.db uvicorn app.main:app
+```
+
+恢复后可这样核对：`GET /devices/{device_id}/events` 能查到备份时刻的事件，`GET /event-changes` 的 `head_change_id` 等于清单中的 `max_change_id`，之后的新写入仍从该水位连续追加，无空洞。若恢复时环境变量里的阈值或 `WATER_MAX_SAMPLE_GAP_SECONDS` 与备份库持久化的值不同，启动会与往常一样按当前配置重算派生事件（原始采样、变更流、确认行都保留）。
+
 ## 数据库升级与迁移
 
 `events` 表是 `samples` 原始采样的纯派生数据。服务启动时比对 `schema_meta` 中持久化的 `schema_version` 与代码版本：
@@ -514,3 +589,4 @@ pytest -q
 - `GET /devices/{device_id}/events/{event_id}/evidence` 是只读查询：在一次只读事务快照中同时读取事件、生效阈值与该设备原始采样，并用写入路径同一个状态机定位成员，不写入事件、确认，也不追加变更流。迟到写入、更正或配置变更后下一次查询即反映最新证据，事件消失则返回 `404`。
 - `POST /devices/{device_id}/turbidity-exposure` 是只读查询：在一次只读快照中读取该设备原始采样与当前最大采样间隔，按线性插值累计超阈时长与面积，不写入采样、事件、确认，也不追加变更流。迟到写入或更正提交后，下一次查询即反映新结果。
 - 升级时 `schema_version` 与事件重算在同一事务提交；升级任一阶段中断后重启会自动重新迁移，从原始采样恢复全部派生事件。`event_changes` 与 `event_acks` 表都不是派生缓存，升级时不会被丢弃。
+- `POST /maintenance/backup` 是只读维护接口：通过 SQLite 在线备份接口把单个已提交快照复制到临时文件，随后执行 `PRAGMA integrity_check`，校验为 `ok` 才连同从备份库读出的 `manifest.json`（结构版本、四张业务表行数、最大 `change_id`、`water.db` 的 SHA-256）打包下载。备份不写入在线库；与采样写入、迟到重算、更正或确认并发时包内数据不跨事务混合。校验或打包失败时返回 `500` 并清理临时文件，不发送半成品。下载到的 `water.db` 放到 `WATER_DATABASE_PATH` 即可启动并查询原有数据。
