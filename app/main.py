@@ -3,9 +3,10 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, Query, status
+from fastapi import Depends, FastAPI, Query, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -27,6 +28,7 @@ from .schemas import (
     ThresholdsOut,
     TurbidityExposureIn,
     TurbidityExposureOut,
+    BackupError,
     ConflictError,
     NotFoundError,
 )
@@ -107,6 +109,14 @@ def handle_request_validation(
 def handle_not_found(_request, exc: NotFoundError) -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_404_NOT_FOUND,
+        content={"detail": exc.detail},
+    )
+
+
+@app.exception_handler(BackupError)
+def handle_backup_error(_request, exc: BackupError) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": exc.detail},
     )
 
@@ -357,3 +367,48 @@ def event_changes(
     before the first change).
     """
     return service.list_event_changes(after=after, limit=limit)
+
+
+@app.post(
+    "/maintenance/backup",
+    response_class=Response,
+    tags=["maintenance"],
+    responses={
+        200: {
+            "content": {"application/zip": {}},
+            "description": "ZIP archive with water.db and manifest.json",
+        }
+    },
+)
+def download_backup(
+    service: Annotated[WaterQualityService, Depends(get_service)],
+) -> Response:
+    """
+    Download a consistent backup of the whole database as a ZIP archive.
+
+    The SQLite online backup API copies the live database into a single
+    committed snapshot, serialized with every write transaction (sample
+    ingest, late recomputation, correction, acknowledgement), so the
+    archive never mixes rows across transactions. The copy is verified
+    with ``PRAGMA integrity_check`` before packing; on failure no
+    partial archive is sent and the live database is left untouched.
+
+    The archive contains two entries:
+
+    - ``water.db``: the snapshot itself. Place it at
+      ``WATER_DATABASE_PATH`` with the original configuration to start
+      the service and query the original data offline.
+    - ``manifest.json``: ``schema_version``, the row counts of the four
+      business tables (samples, events, event_changes, event_acks) and
+      the maximum ``change_id`` (0 when the change stream is empty),
+      all read from the backup database, plus the SHA-256 of
+      ``water.db``.
+    """
+    archive = service.create_backup_archive()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename = f"water-backup-{timestamp}.zip"
+    return Response(
+        content=archive,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

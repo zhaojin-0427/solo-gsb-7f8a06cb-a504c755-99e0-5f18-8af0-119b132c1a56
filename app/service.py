@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-from . import db
+from . import backup, db
 from .config import Settings
 from .schemas import (
     AcknowledgeIn,
@@ -157,6 +157,20 @@ class WaterQualityService:
             recovery_threshold=self._settings.recovery_threshold,
             max_sample_gap_seconds=self._settings.max_sample_gap_seconds,
         )
+
+    def create_backup_archive(self) -> bytes:
+        """Package one committed snapshot of the database as a ZIP archive.
+
+        The write lock serializes the backup with every write transaction
+        (ingest, replay, correction, acknowledgement, startup rebuild),
+        so the SQLite online backup copies exactly one committed state
+        and the archive never mixes rows across transactions. The copy is
+        integrity-checked and the manifest is read from it before the ZIP
+        is packed; a failure raises BackupError without sending a partial
+        archive, and the live database is never modified.
+        """
+        with self._write_lock:
+            return backup.create_backup_zip(self._connection)
 
     def ingest_batch(self, batch: BatchIn) -> BatchOut:
         unique_records: dict[tuple[str, int], SampleIn] = {}
